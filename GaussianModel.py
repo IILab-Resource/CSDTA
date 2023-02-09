@@ -14,10 +14,58 @@ import metrics
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from entmax.activations import entmax15
 
+
+
+from torch.nn.modules.loss import _Loss
+from torch.distributions import MultivariateNormal as MVN
 from dataset import PT_FEATURE_SIZE
-
-
 CHAR_SMI_SET_LEN = 64
+
+class BMCLossMD(_Loss):
+    """
+    Multi-Dimension version BMC, compatible with 1-D BMC
+    """
+
+    def __init__(self, init_noise_sigma):
+        super(BMCLossMD, self).__init__()
+        self.noise_sigma = torch.nn.Parameter(torch.tensor(init_noise_sigma)).cuda()
+
+    def forward(self, pred, target):
+        noise_var = self.noise_sigma ** 2
+        loss = bmc_loss_md(pred, target, noise_var)
+        return loss
+
+
+def bmc_loss_md(pred, target, noise_var):
+    target = target.unsqueeze(1)
+    # print(pred.size(), target.size())
+    I = torch.eye(pred.shape[-1]).cuda()
+    logits = MVN(pred.unsqueeze(1), noise_var*I).log_prob(target.unsqueeze(0))
+    loss = F.cross_entropy(logits, torch.arange(pred.shape[0]).cuda())
+    loss = loss * (2 * noise_var).detach()
+    return loss
+    
+class ReweightL2(_Loss):
+    def __init__(self, train_dist, reweight='inverse'):
+        super(ReweightL2, self).__init__()
+        self.reweight = reweight
+        self.train_dist = train_dist
+
+    def forward(self, pred, target):
+        reweight = self.reweight
+        prob = self.train_dist.log_prob(target).exp().squeeze(-1)
+        if reweight == 'inverse':
+            inv_prob = prob.pow(-1)
+        elif reweight == 'sqrt_inv':
+            inv_prob = prob.pow(-0.5)
+        else:
+            raise NotImplementedError
+        inv_prob = inv_prob / inv_prob.sum()
+        loss = F.mse_loss(pred, target, reduction='none').sum(-1) * inv_prob
+        loss = loss.sum()
+        return loss
+
+
 
 
 class MultiHeadAttentionReciprocal(nn.Module):
@@ -118,6 +166,7 @@ class ConcatELU(nn.Module):
     def forward(self,x):
         return torch.cat([F.relu(x),F.relu(-x)],dim=1)
 
+
 class LayerNormChannels(nn.Module):
     def __init__(self,in_channels):
         '''
@@ -216,7 +265,44 @@ class MuSigma(nn.Module):
         # sigma = torch.nn.Softplus()( sigma  ) + 1e-6
         return mu, sigma    
 
- 
+class decoder(nn.Module):
+    def __init__(self, init_dim, num_filters, k_size,size):
+        super(decoder, self).__init__()
+        self.layer = nn.Sequential(
+            nn.Linear(num_filters , 1   * (init_dim - 3 * (k_size - 1))),
+            # nn.Linear(num_filters , 1   * (init_dim)),
+            nn.GELU()
+        )
+        self.convt = nn.Sequential(
+            nn.ConvTranspose1d(1, num_filters, k_size, 1, 0),
+            nn.GELU(),
+            nn.ConvTranspose1d(num_filters, num_filters, k_size, 1, 0 ),
+            nn.GELU(),
+            nn.ConvTranspose1d(num_filters, num_filters, k_size, 1, 0 ),
+            nn.GELU(),
+        )
+        # self.layer2 = nn.Linear(256, size)
+        self.gru = nn.GRU(num_filters, num_filters, batch_first=True, num_layers=2)
+        self.layer2 =  nn.Sequential(
+            nn.Linear(num_filters,size)
+        )
+        self.init_dim = init_dim
+        self.num_filters = num_filters
+        self.k_size = k_size 
+
+
+    def forward(self, x):
+        x = self.layer(x)
+        # x = x.view(-1, 1, self.init_dim)
+        
+        x = x.view(-1, 1, self.init_dim - 3 * (self.k_size - 1))
+        x = self.convt(x)
+        x = x.permute(0,2,1)
+        x, _ = self.gru(x)
+        x = self.layer2(x)
+        return x
+
+
 
 class GaussianNet(nn.Module):
     
@@ -244,16 +330,21 @@ class GaussianNet(nn.Module):
         self.transform = nn.Sequential(
             nn.LayerNorm(out_dim),
             nn.Linear(out_dim, 1),
-            # nn.ReLU(),
-            # nn.Linear(256, 1),
-            # nn.ReLU(),
-            # nn.Linear(1024, 512),
-            # nn.ReLU(),
-            # nn.Linear(512, 1),
         )
+        self.decoder1 = decoder(150, out_dim, 3, 64)
+        self.decoder2 = decoder(1000, out_dim, 3, 25)
+
+
         # self.final_predict = nn.Linear(256, 1)
-         
-    def forward(self, seq, smi):
+    
+    def reparametrize(self, mean, logvar):
+        std = logvar.mul(0.5).exp_()
+        eps = torch.cuda.FloatTensor(std.size()).normal_(0,0.1)
+        eps = Variable(eps)
+        return eps.mul(std).add_(mean)
+
+
+    def forward(self, seq, smi, seq_onehot, smi_onehot):
         
         # smi = self.embed_smile(smi) 
         # seq  = self.embed_prot(seq) 
@@ -262,8 +353,8 @@ class GaussianNet(nn.Module):
 
         proteinFeature_onehot = Reduce('b n d -> b d', 'max')(proteinFeature_onehot)
         compoundFeature_onehot = Reduce('b n d -> b d', 'max')(compoundFeature_onehot)
- 
 
+        
         mu_drug, logvar_drug = self.musigma_drug(compoundFeature_onehot)
         mu_prot, logvar_prot = self.musigma_prot(proteinFeature_onehot)
          
@@ -275,18 +366,28 @@ class GaussianNet(nn.Module):
         # all_features = torch.cat([mu_drug*mu_prot, w2_dist], dim=1)   
         out = self.transform(w2_dist)
         
-        # nllloss1 = self.NLLLoss(mu_drug, logvar_drug, compoundFeature_onehot)
-        # nllloss2 = self.NLLLoss(mu_prot, logvar_prot, proteinFeature_onehot)
-        # print(nllloss1.item(), nllloss2.item())
-        return out #,  (nllloss1+nllloss2)
- 
-    def NLLLoss(self, mu, sigma, y):
-        # sigma = torch.nn.Softplus()( sigma  ) + 1e-6
-        sigma = torch.exp(sigma)
-        loss = torch.mean((torch.log(sigma) / 2) + (torch.pow((mu - y), 2) / (2 * sigma)))
-        # loss = torch.mean(   (torch.pow((mu - y), 2) / (2 * sigma)))
 
-        return loss
+        # VAE Decoder
+        drug_sample  = self.reparametrize(mu_drug, logvar_drug)
+        target_sample  = self.reparametrize(mu_prot, logvar_prot)
+
+        recon_drug = self.decoder1(drug_sample)
+        recon_target = self.decoder2(target_sample)
+
+        loss_drug = self.loss_f(recon_drug, smi_onehot, mu_drug, logvar_drug)
+        loss_target = self.loss_f(recon_target, seq_onehot, mu_prot, logvar_prot)
+        lamda = -1
+        return out,  10**lamda * (loss_drug + 150 / 1000 * loss_target), w2_dist
+     
+
+
+    def  loss_f(self, recon_x, x, mu, logvar):
+        cit = nn.CrossEntropyLoss(reduction='none', ignore_index=0)
+        cr_loss = torch.sum(cit(recon_x.permute(0, 2, 1), x), 1)
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), 1)
+        return torch.mean(1e-2*cr_loss + KLD)
+
+
 
 class GaussianNetVis(nn.Module):
     
@@ -332,6 +433,131 @@ class GaussianNetVis(nn.Module):
         
         return out,  w2_dist
 
+
+class WOGaussianNet(nn.Module):
+    
+    def __init__(self):
+        
+        super(WOGaussianNet, self).__init__()
+
+        embed_dim = 256
+        out_dim = 256
+        hidden_dim = 256
+        # onehot smiles
+        # self.embed_smile = nn.Embedding( 65, embed_dim)
+        # self.embed_prot = nn.Embedding( 26, embed_dim)
+        
+        self.onehot_smi_net = GatedResNet( 384, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
+        self.onehot_prot_net = GatedResNet( 1024, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
+        
+ 
+
+        self.musigma_prot = MuSigma(out_dim)
+        self.musigma_drug = MuSigma(out_dim)
+        
+       
+        
+        self.transform = nn.Sequential(
+            nn.LayerNorm(out_dim*2),
+            nn.Linear(out_dim*2, 1),
+        )
+        self.decoder1 = decoder(150, out_dim, 3, 64)
+        self.decoder2 = decoder(1000, out_dim, 3, 25)
+
+
+        # self.final_predict = nn.Linear(256, 1)
+    
+    def reparametrize(self, mean, logvar):
+        std = logvar.mul(0.5).exp_()
+        eps = torch.cuda.FloatTensor(std.size()).normal_(0,0.1)
+        eps = Variable(eps)
+        return eps.mul(std).add_(mean)
+
+
+    def forward(self, seq, smi, seq_onehot, smi_onehot):
+        
+        # smi = self.embed_smile(smi) 
+        # seq  = self.embed_prot(seq) 
+        proteinFeature_onehot = self.onehot_prot_net( seq) 
+        compoundFeature_onehot = self.onehot_smi_net( smi )
+
+        proteinFeature_onehot = Reduce('b n d -> b d', 'max')(proteinFeature_onehot)
+        compoundFeature_onehot = Reduce('b n d -> b d', 'max')(compoundFeature_onehot)
+
+        
+        mu_drug, logvar_drug = self.musigma_drug(compoundFeature_onehot)
+        mu_prot, logvar_prot = self.musigma_prot(proteinFeature_onehot)
+         
+        
+
+        # VAE Decoder
+        drug_sample  = self.reparametrize(mu_drug, logvar_drug)
+        target_sample  = self.reparametrize(mu_prot, logvar_prot)
+
+        all_features = torch.cat([drug_sample, target_sample], dim=1)   
+        out = self.transform(all_features)
+
+        recon_drug = self.decoder1(drug_sample)
+        recon_target = self.decoder2(target_sample)
+
+        loss_drug = self.loss_f(recon_drug, smi_onehot, mu_drug, logvar_drug)
+        loss_target = self.loss_f(recon_target, seq_onehot, mu_prot, logvar_prot)
+        lamda = -1
+        return out,  10**lamda * (loss_drug + 150 / 1000 * loss_target), all_features
+     
+
+
+    def  loss_f(self, recon_x, x, mu, logvar):
+        cit = nn.CrossEntropyLoss(reduction='none', ignore_index=0)
+        cr_loss = torch.sum(cit(recon_x.permute(0, 2, 1), x), 1)
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), 1)
+        return torch.mean(1e-2*cr_loss + KLD)
+
+# class WOGaussianNet(nn.Module):
+    
+#     def __init__(self):
+        
+#         super(WOGaussianNet, self).__init__()
+
+#         embed_dim = 256
+#         out_dim = 256
+#         hidden_dim = 256
+#         # onehot smiles
+#         # self.embed_smile = nn.Embedding( 65, embed_dim)
+#         # self.embed_prot = nn.Embedding( 26, embed_dim)
+        
+#         self.onehot_smi_net = GatedResNet( 384, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
+#         self.onehot_prot_net = GatedResNet( 1024, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
+        
+ 
+
+        
+        
+#         self.transform = nn.Sequential(
+#             nn.LayerNorm(out_dim*2),
+#             nn.Linear(out_dim*2, 1),
+#         )
+         
+ 
+
+
+#     def forward(self, seq, smi, seq_onehot, smi_onehot):
+        
+#         # smi = self.embed_smile(smi) 
+#         # seq  = self.embed_prot(seq) 
+#         proteinFeature_onehot = self.onehot_prot_net( seq) 
+#         compoundFeature_onehot = self.onehot_smi_net( smi )
+
+#         proteinFeature_onehot = Reduce('b n d -> b d', 'max')(proteinFeature_onehot)
+#         compoundFeature_onehot = Reduce('b n d -> b d', 'max')(compoundFeature_onehot)        
+#         all_features = torch.cat([proteinFeature_onehot, compoundFeature_onehot], dim=1)   
+#         out = self.transform(all_features)
+         
+#         return out,  0
+     
+
+
+
 class WOPretrainedNet(nn.Module):
     
     def __init__(self):
@@ -345,77 +571,160 @@ class WOPretrainedNet(nn.Module):
         self.embed_smile = nn.Embedding( 65, 384)
         self.embed_prot = nn.Embedding( 26, 1024)
         
-        # onehot smiles
         self.onehot_smi_net = GatedResNet( 384, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
-        # onehot protein
         self.onehot_prot_net = GatedResNet( 1024, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
-         
+        
+ 
+
         self.musigma_prot = MuSigma(out_dim)
         self.musigma_drug = MuSigma(out_dim)
+        
+       
         
         self.transform = nn.Sequential(
             nn.LayerNorm(out_dim),
             nn.Linear(out_dim, 1),
-            
         )
+        self.decoder1 = decoder(150, out_dim, 3, 64)
+        self.decoder2 = decoder(1000, out_dim, 3, 25)
+
+
         # self.final_predict = nn.Linear(256, 1)
-         
-    def forward(self, seq, smi):
+    
+    def reparametrize(self, mean, logvar):
+        std = logvar.mul(0.5).exp_()
+        eps = torch.cuda.FloatTensor(std.size()).normal_(0,0.1)
+        eps = Variable(eps)
+        return eps.mul(std).add_(mean)
+
+
+    def forward(self, seq, smi, seq_onehot, smi_onehot):
         
-        smi = self.embed_smile(smi) 
-        seq  = self.embed_prot(seq) 
+        smi = self.embed_smile(smi_onehot) 
+        seq  = self.embed_prot(seq_onehot) 
         proteinFeature_onehot = self.onehot_prot_net( seq) 
         compoundFeature_onehot = self.onehot_smi_net( smi )
 
         proteinFeature_onehot = Reduce('b n d -> b d', 'max')(proteinFeature_onehot)
         compoundFeature_onehot = Reduce('b n d -> b d', 'max')(compoundFeature_onehot)
+
+        
         mu_drug, logvar_drug = self.musigma_drug(compoundFeature_onehot)
         mu_prot, logvar_prot = self.musigma_prot(proteinFeature_onehot)
          
         euclidean_dist = torch.square( mu_drug - mu_prot )
 
-        w2_dist = euclidean_dist + torch.square(torch.sqrt(torch.exp(logvar_drug))-torch.sqrt(torch.exp(logvar_prot)))
+        w2_dist = euclidean_dist + torch.square(torch.sqrt( torch.exp(logvar_drug))-torch.sqrt( torch.exp(logvar_prot)))
 
-    
+
+        # all_features = torch.cat([mu_drug*mu_prot, w2_dist], dim=1)   
         out = self.transform(w2_dist)
         
-        return out
 
-class WOGaussianNet(nn.Module):
+        # VAE Decoder
+        drug_sample  = self.reparametrize(mu_drug, logvar_drug)
+        target_sample  = self.reparametrize(mu_prot, logvar_prot)
+
+        recon_drug = self.decoder1(drug_sample)
+        recon_target = self.decoder2(target_sample)
+
+        loss_drug = self.loss_f(recon_drug, smi_onehot, mu_drug, logvar_drug)
+        loss_target = self.loss_f(recon_target, seq_onehot, mu_prot, logvar_prot)
+        lamda = -1
+        return out,  10**lamda * (loss_drug + 150 / 1000 * loss_target)
+     
+
+
+    def  loss_f(self, recon_x, x, mu, logvar):
+        cit = nn.CrossEntropyLoss(reduction='none', ignore_index=0)
+        cr_loss = torch.sum(cit(recon_x.permute(0, 2, 1), x), 1)
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), 1)
+        return torch.mean(1e-2*cr_loss + KLD)
+
+# class WOPretrainedNet(nn.Module):
     
-    def __init__(self):
+#     def __init__(self):
         
-        super(WOGaussianNet, self).__init__()
+#         super(WOPretrainedNet, self).__init__()
 
-        embed_dim = 256
-        out_dim = 256
-        hidden_dim = 256
+#         embed_dim = 256
+#         out_dim = 256
+#         hidden_dim = 256
+#         # onehot smiles
+#         self.embed_smile = nn.Embedding( 65, 384)
+#         self.embed_prot = nn.Embedding( 26, 1024)
         
-        self.onehot_smi_net = GatedResNet( 384, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
-        # onehot protein
-        self.onehot_prot_net = GatedResNet( 1024, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
+#         # onehot smiles
+#         self.onehot_smi_net = GatedResNet( 384, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
+#         # onehot protein
+#         self.onehot_prot_net = GatedResNet( 1024, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
+         
+#         self.musigma_prot = MuSigma(out_dim)
+#         self.musigma_drug = MuSigma(out_dim)
+        
+#         self.transform = nn.Sequential(
+#             nn.LayerNorm(out_dim),
+#             nn.Linear(out_dim, 1),
+            
+#         )
+#         # self.final_predict = nn.Linear(256, 1)
+         
+#     def forward(self, seq, smi):
+        
+#         smi = self.embed_smile(smi) 
+#         seq  = self.embed_prot(seq) 
+#         proteinFeature_onehot = self.onehot_prot_net( seq) 
+#         compoundFeature_onehot = self.onehot_smi_net( smi )
+
+#         proteinFeature_onehot = Reduce('b n d -> b d', 'max')(proteinFeature_onehot)
+#         compoundFeature_onehot = Reduce('b n d -> b d', 'max')(compoundFeature_onehot)
+#         mu_drug, logvar_drug = self.musigma_drug(compoundFeature_onehot)
+#         mu_prot, logvar_prot = self.musigma_prot(proteinFeature_onehot)
+         
+#         euclidean_dist = torch.square( mu_drug - mu_prot )
+
+#         w2_dist = euclidean_dist + torch.square(torch.sqrt(torch.exp(logvar_drug))-torch.sqrt(torch.exp(logvar_prot)))
+
+    
+#         out = self.transform(w2_dist)
+        
+#         return out
+
+# class WOGaussianNet(nn.Module):
+    
+#     def __init__(self):
+        
+#         super(WOGaussianNet, self).__init__()
+
+#         embed_dim = 256
+#         out_dim = 256
+#         hidden_dim = 256
+        
+#         self.onehot_smi_net = GatedResNet( 384, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
+#         # onehot protein
+#         self.onehot_prot_net = GatedResNet( 1024, hidden_dim, out_dim, num_layers=5, pool_size=2,dilaSize=1)
       
        
         
-        self.transform = nn.Sequential(
-            nn.LayerNorm(out_dim*2),
-            nn.Linear(out_dim*2, 1),
+#         self.transform = nn.Sequential(
+#             nn.LayerNorm(out_dim*2),
+#             nn.Linear(out_dim*2, 1),
             
-        )
+#         )
          
-    def forward(self, seq, smi):
+#     def forward(self, seq, smi):
         
-        proteinFeature_onehot = self.onehot_prot_net( seq) 
-        compoundFeature_onehot = self.onehot_smi_net( smi )
+#         proteinFeature_onehot = self.onehot_prot_net( seq) 
+#         compoundFeature_onehot = self.onehot_smi_net( smi )
 
-        proteinFeature_onehot = Reduce('b n d -> b d', 'max')(proteinFeature_onehot)
-        compoundFeature_onehot = Reduce('b n d -> b d', 'max')(compoundFeature_onehot)
+#         proteinFeature_onehot = Reduce('b n d -> b d', 'max')(proteinFeature_onehot)
+#         compoundFeature_onehot = Reduce('b n d -> b d', 'max')(compoundFeature_onehot)
 
  
-        all_features =   torch.cat([proteinFeature_onehot, compoundFeature_onehot], dim=1)    
-        out = self.transform(all_features)
+#         all_features =   torch.cat([proteinFeature_onehot, compoundFeature_onehot], dim=1)    
+#         out = self.transform(all_features)
         
-        return out
+#         return out
  
     
 class VIBNet(nn.Module):
@@ -480,15 +789,18 @@ def test(model: nn.Module, test_loader, loss_function, device, show):
     test_loss = 0
     outputs = []
     targets = []
+    loss_function = nn.MSELoss(reduction='mean')
     with torch.no_grad():
         for idx, (*x, y) in tqdm(enumerate(test_loader), disable=not show, total=len(test_loader)):
             for i in range(len(x)):
                 x[i] = x[i].to(device)
             y = y.to(device)
 
-            y_hat  = model(*x)
+            y_hat, _ , _ = model(*x)
 
             test_loss += loss_function(y_hat.view(-1), y.view(-1)).item()
+            # test_loss += loss_function(y_hat, y).item()
+
             outputs.append(y_hat.cpu().numpy().reshape(-1))
             targets.append(y.cpu().numpy().reshape(-1))
 
@@ -508,26 +820,3 @@ def test(model: nn.Module, test_loader, loss_function, device, show):
 
     return evaluation
 
-
-class FGM():
-    def __init__(self, model):
-        self.model = model
-        self.backup = {}
-
-    def attack(self, epsilon=0.01, emb_name='embed'):
-        # emb_name这个参数要换成你模型中embedding的参数名
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and emb_name in name:
-                self.backup[name] = param.data.clone()
-                norm = torch.norm(param.grad)
-                if norm != 0 and not torch.isnan(norm):
-                    r_at = epsilon * param.grad / norm
-                    param.data.add_(r_at)
-
-    def restore(self, emb_name='embed'):
-        # emb_name这个参数要换成你模型中embedding的参数名
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and emb_name in name: 
-                assert name in self.backup
-                param.data = self.backup[name]
-        self.backup = {}
